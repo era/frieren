@@ -9,6 +9,12 @@ pub struct Query {
     pub stmts: Vec<Statement>,
 }
 
+impl Query {
+    pub fn logical_plan(&self) -> () {
+        todo!()
+    }
+}
+
 pub fn parse(sql: &str) -> Result<Query, Error> {
     Ok(Query {
         stmts: Parser::parse_sql(&DIALECT, sql)?,

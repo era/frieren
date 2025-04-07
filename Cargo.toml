@@ -1,0 +1,15 @@
+[package]
+name = "frieren"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iceberg = "0.4.0"
+iceberg-catalog-memory = "0.4.0"
+okaywal = "0.3.1"
+sqlparser = "0.55.0"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.19.1"

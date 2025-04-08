@@ -1,10 +1,12 @@
 use crate::error::Error;
 use crate::frontend::Query;
+use iceberg::spec::Schema;
+use iceberg::table::Table;
 use iceberg::{io::FileIOBuilder, Catalog};
-use iceberg::{Namespace, NamespaceIdent};
+use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 use okaywal::{Entry, EntryId, LogManager, SegmentReader, WriteAheadLog};
-use sqlparser::ast::Use;
+use sqlparser::ast::{CreateTable, Use};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 pub enum Output {
     CreatedDatabase(String),
     Use(Context),
+    CreatedTable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -81,6 +84,13 @@ impl Storage {
                     .to_url_string(),
             )),
             sqlparser::ast::Statement::Use(u) => Ok(Output::Use(self.use_stmt(ctx, u).await?)),
+            sqlparser::ast::Statement::CreateTable(create_table) => Ok(Output::CreatedTable(
+                self.create_table(ctx, create_table)
+                    .await?
+                    .identifier()
+                    .name
+                    .clone(),
+            )),
             e => Err(Error::NotSupportedSql(e.to_string())),
         }
     }
@@ -111,19 +121,30 @@ impl Storage {
         // we use namespace as database, so if the user created a `my_cool_schema.my_cool_db`
         let namespace_ident = object_name_to_namespace(ctx, db_name)?;
         //check if exists and what if_not_exists is set to do
-        match self.catalog.get_namespace(&namespace_ident).await {
-            // we probably should keep a catalog and check for this type of errors
-            // on the frontend
-            Ok(namespace) if !if_not_exists => Err(Error::DatabaseAlreadyExist(
-                namespace.name().to_url_string(),
-            )),
-            //FIXME: Should really check error, but let's for now just assume it means the namespace do not exist
-            Err(_) => Ok(self
+        match self.catalog.namespace_exists(&namespace_ident).await? {
+            true if !if_not_exists => {
+                Err(Error::DatabaseAlreadyExist(namespace_ident.to_url_string()))
+            }
+            false => Ok(self
                 .catalog
                 .create_namespace(&namespace_ident, HashMap::new())
                 .await?),
-            Ok(namespace) => Ok(namespace), // if already exists, but `if_not_exists` just keep going
+            true => Ok(self.catalog.get_namespace(&namespace_ident).await?), // if already exists, but `if_not_exists` just keep going
         }
+    }
+
+    async fn create_table(&self, ctx: Context, table: CreateTable) -> Result<Table, Error> {
+        let table_identifier = object_name_to_table(ctx, table.name)?;
+        //TODO schema
+        let schema = Schema::builder().build()?;
+        let creation = TableCreation::builder()
+            .name(table_identifier.name)
+            .schema(schema)
+            .build();
+        Ok(self
+            .catalog
+            .create_table(&table_identifier.namespace, creation)
+            .await?)
     }
 }
 
@@ -144,6 +165,32 @@ fn object_name_to_namespace(
     )?)
 }
 
+fn object_name_to_table(
+    ctx: Context,
+    table_name: sqlparser::ast::ObjectName,
+) -> Result<TableIdent, Error> {
+    if table_name.0.len() > 1 {
+        return Err(Error::NotSupportedSql(
+            "Syntax schema.table not supported yet".to_string(),
+        ));
+    }
+
+    let namespace = match ctx.namespace {
+                None => return Err(Error::NotSupportedSql("Must first select a database by using `use database` or a schema by using `use schema`".to_string())),
+                Some(namespace) => namespace,
+        };
+
+    Ok(TableIdent::new(
+        namespace.name().clone(),
+        table_name
+            .0
+            .into_iter()
+            // it's safe to unwrap as_indent because as now there will always be one there
+            .map(|i| i.as_ident().unwrap().value.clone())
+            .collect(),
+    ))
+}
+
 fn new_memory_catalog() -> Result<MemoryCatalog, Error> {
     let file_io = FileIOBuilder::new_fs_io().build()?;
     Ok(MemoryCatalog::new(file_io, None))
@@ -156,7 +203,7 @@ struct WalRecover {
 
 impl LogManager for WalRecover {
     fn recover(&mut self, _entry: &mut Entry<'_>) -> std::io::Result<()> {
-        //TODO
+        //TODO only needed if we are using MemoryCatalog (only option right now)
         Ok(())
     }
 

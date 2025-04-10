@@ -15,8 +15,11 @@ pub struct Query {
 }
 
 impl Query {
-    pub fn logical_plan(&self) -> Vec<LogicalPlan> {
-        todo!()
+    pub fn logical_plan(self) -> impl IntoIterator<Item = LogicalPlan> {
+        self.stmts.into_iter().map(|s| match s {
+            // TODO
+            any => LogicalPlan::DDL(any),
+        })
     }
 }
 

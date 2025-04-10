@@ -1,14 +1,15 @@
 use crate::error::Error;
 use crate::frontend::Query;
-use iceberg::spec::Schema;
+use iceberg::spec::{NestedField, PrimitiveType, Schema};
 use iceberg::table::Table;
 use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 use okaywal::{Entry, EntryId, LogManager, SegmentReader, WriteAheadLog};
-use sqlparser::ast::{CreateTable, Use};
+use sqlparser::ast::{CreateTable, DataType, ObjectName, ObjectType, Use};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq)]
@@ -16,6 +17,7 @@ pub enum Output {
     CreatedDatabase(String),
     Use(Context),
     CreatedTable(String),
+    Drop(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -91,14 +93,58 @@ impl Storage {
                     .name
                     .clone(),
             )),
+            sqlparser::ast::Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                ..
+            } => Ok(Output::Drop(
+                self.drop_object(ctx, object_type, if_exists, names).await?,
+            )),
             e => Err(Error::NotSupportedSql(e.to_string())),
         }
     }
 
+    async fn drop_object(
+        &self,
+        ctx: Context,
+        object_type: ObjectType,
+        if_exists: bool,
+        names: Vec<ObjectName>,
+    ) -> Result<Vec<String>, Error> {
+        let mut dropped_items = Vec::new();
+        match object_type {
+            ObjectType::Table => {
+                for name in names {
+                    let table = object_name_to_table(ctx.clone(), name)?;
+                    if if_exists && !self.catalog.table_exists(&table).await? {
+                        return Err(Error::NotPossibletoDrop(table.name));
+                    }
+                    self.catalog.drop_table(&table).await?;
+                    dropped_items.push(table.name);
+                }
+            }
+            ObjectType::Database | ObjectType::Schema => {
+                for name in names {
+                    let namespace = object_name_to_namespace(ctx.clone(), name)?;
+
+                    if if_exists && !self.catalog.namespace_exists(&namespace).await? {
+                        return Err(Error::NotPossibletoDrop(namespace.to_url_string()));
+                    }
+
+                    self.catalog.drop_namespace(&namespace).await?;
+                    dropped_items.push(namespace.to_url_string());
+                }
+            }
+            _ => return Err(Error::NotSupportedSql("Cannot drop the item".to_string())),
+        };
+        Ok(dropped_items)
+    }
+
     async fn use_stmt(&self, ctx: Context, u: Use) -> Result<Context, Error> {
         match u {
-            // for us both means the same
-            Use::Schema(name) | Use::Database(name) => {
+            // for us all means the same
+            Use::Schema(name) | Use::Database(name) | Use::Object(name) => {
                 // if the name exists
                 let namespace_ident = object_name_to_namespace(ctx, name)?;
                 let namespace = self.catalog.get_namespace(&namespace_ident).await?;
@@ -135,16 +181,60 @@ impl Storage {
 
     async fn create_table(&self, ctx: Context, table: CreateTable) -> Result<Table, Error> {
         let table_identifier = object_name_to_table(ctx, table.name)?;
-        //TODO schema
-        let schema = Schema::builder().build()?;
+
+        let (fields, mut err): (Vec<Result<NestedField, Error>>, _) = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(id, value)| {
+                Ok::<NestedField, Error>(NestedField::new(
+                    id as i32,
+                    value.name.value.clone(),
+                    type_for(&value.data_type)?.into(),
+                    false, // assuming all types are not required
+                ))
+            })
+            .partition(Result::is_ok);
+
+        if err.len() > 0 {
+            // Kinda ugly, but if any error, just return the first
+            return Err(err.pop().unwrap().unwrap_err());
+        }
+
+        let schema = Schema::builder()
+            .with_fields(fields.into_iter().map(|f| Arc::new(f.unwrap().into())))
+            .build()?;
         let creation = TableCreation::builder()
+            .location(
+                self.path
+                    .join(&table_identifier.name)
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            )
             .name(table_identifier.name)
             .schema(schema)
             .build();
+
         Ok(self
             .catalog
             .create_table(&table_identifier.namespace, creation)
             .await?)
+    }
+}
+
+fn type_for(sql_type: &DataType) -> Result<PrimitiveType, Error> {
+    match sql_type {
+        DataType::Boolean | DataType::Bool => Ok(PrimitiveType::Boolean),
+        DataType::Int32 => Ok(PrimitiveType::Int),
+        DataType::Int64 => Ok(PrimitiveType::Long),
+        DataType::Date => Ok(PrimitiveType::Date),
+        DataType::Float32 => Ok(PrimitiveType::Float),
+        DataType::Float64 => Ok(PrimitiveType::Double),
+        DataType::String(_) => Ok(PrimitiveType::String),
+        _ => Err(Error::NotSupportedSql(
+            "column type is not supported".to_string(),
+        )),
     }
 }
 
@@ -203,7 +293,7 @@ struct WalRecover {
 
 impl LogManager for WalRecover {
     fn recover(&mut self, _entry: &mut Entry<'_>) -> std::io::Result<()> {
-        //TODO only needed if we are using MemoryCatalog (only option right now)
+        //TODO
         Ok(())
     }
 
@@ -247,6 +337,25 @@ mod tests {
             vec![Output::CreatedDatabase(
                 "a_database\u{1f}inside_another".to_string()
             )],
+            storage.execute(sql).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    pub async fn create_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().to_owned()).unwrap();
+        let sql = parse(
+            "create database a_database; use a_database; create table my_table (a int32, b string); drop table my_table; drop database a_database;",
+        )
+        .unwrap();
+        assert_eq!(
+            vec![
+                Output::CreatedDatabase("a_database".to_string()),
+                Output::CreatedTable("my_table".to_string()),
+                Output::Drop(vec!["my_table".to_string()]),
+                Output::Drop(vec!["a_database".to_string()]),
+            ],
             storage.execute(sql).await.unwrap()
         );
     }

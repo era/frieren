@@ -14,4 +14,7 @@ pub enum Error {
 
     #[error("Database already exist: {0}")]
     DatabaseAlreadyExist(String),
+
+    #[error("Item does not exist: {0}")]
+    NotPossibletoDrop(String),
 }

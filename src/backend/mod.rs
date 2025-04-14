@@ -251,7 +251,7 @@ impl Storage {
         let data_files = writer.close().await?;
 
         // now write to the metadata of our table
-        fast_append.add_data_files(data_files).await?;
+        fast_append.add_data_files(data_files)?;
         fast_append.apply().await?;
 
         Ok(())
@@ -328,6 +328,8 @@ struct WalRecover {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{ArrayRef, Int32Array, StringArray};
+    use arrow::datatypes::Field;
     use crate::frontend::parse;
 
     use super::*;
@@ -377,4 +379,33 @@ mod tests {
             storage.execute(sql).await.unwrap()
         );
     }
+
+    #[tokio::test]
+    pub async fn write() {
+        let r = RecordBatch::try_new(
+            arrow::datatypes::Schema::new(vec![
+                Field::new("id", arrow::datatypes::DataType::Int32, false),
+                Field::new("name", arrow::datatypes::DataType::Utf8, false),
+            ]).into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        ).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().to_owned()).unwrap();
+        let sql = parse(
+            "create database a_database; use a_database; create table my_table (id int32, name string);"
+        )
+            .unwrap();
+        storage.execute(sql).await.unwrap();
+        let table = TableIdent::new(NamespaceIdent::new("a_database".to_string()), "my_table".to_string());
+        storage.write(table.clone(), r).await.unwrap();
+
+
+        //TODO verify
+
+    }
+
 }

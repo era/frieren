@@ -5,12 +5,17 @@ use iceberg::table::Table;
 use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
-use okaywal::{Entry, EntryId, LogManager, SegmentReader, WriteAheadLog};
+use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{CreateTable, DataType, ObjectName, ObjectType, Use};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::exit;
 use std::sync::Arc;
+use iceberg::transaction::Transaction;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
 pub enum Output {
@@ -32,28 +37,19 @@ pub struct Context {
 /// which means we have dirty reads all types of nonsense for now.
 pub struct Storage {
     path: PathBuf,
-    wal: WriteAheadLog,
     catalog: Arc<dyn Catalog>,
 }
 
 impl Storage {
     pub fn new(path: PathBuf) -> Result<Self, Error> {
         let catalog = Arc::new(new_memory_catalog()?);
-        let wal = WriteAheadLog::recover(
-            &path,
-            WalRecover {
-                catalog: catalog.clone(),
-            },
-        )?;
-        Ok(Self { path, wal, catalog })
+
+        Ok(Self { path, catalog })
     }
     pub async fn execute(&self, sql: Query) -> Result<Vec<Output>, Error> {
         let mut context = Context::default();
         let mut results = Vec::with_capacity(sql.stmts.len());
-        let mut writer = self.wal.begin_entry()?;
         for stmt in sql.stmts {
-            //FIXME: avoid the allocation
-            writer.write_chunk(stmt.to_string().as_bytes())?;
             let result = self.execute_stmt(context.clone(), stmt).await?;
             // if the previous statement was a `use` we should start using that namespace
             if let Output::Use(ctx) = result {
@@ -63,10 +59,6 @@ impl Storage {
                 results.push(result);
             }
         }
-        //FIXME: should handle the rollback
-        //FIXME: For now, assuming we will autocommit per query send to the server
-        // and not respecting rollback / commits / begin transaction from users
-        writer.commit()?;
         Ok(results)
     }
     async fn execute_stmt(
@@ -221,6 +213,49 @@ impl Storage {
             .create_table(&table_identifier.namespace, creation)
             .await?)
     }
+
+    /// Write an Arrow RecordBatch into Table (writes to a parquet file and updates iceberg metadata).
+    async fn write(&self, name: TableIdent, batch: RecordBatch) -> Result<(), Error> {
+
+
+        // iceberg transaction
+        let table = self.catalog.load_table(&name).await?;
+        let transaction = Transaction::new(&table);
+        let mut fast_append = transaction.fast_append(None, vec![])?;
+
+        // metadata for parquet writer
+        let file_io = table.file_io();
+        let location = DefaultLocationGenerator::new(table.metadata().clone())?;
+
+        // writing files to parquet first
+        let prefix = format!("{}-{}", name.name,  Uuid::new_v4());
+        let file_name_generator = DefaultFileNameGenerator::new(
+            prefix,
+            None, //suffix
+            iceberg::spec::DataFileFormat::Parquet //format
+        );
+        let parquet_props = parquet::file::properties::WriterProperties::builder().build();
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            parquet_props,
+            table.metadata().current_schema().clone(),
+            file_io.clone(),
+            location,
+            file_name_generator,
+        );
+
+        let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None);
+        let mut writer = data_file_writer_builder.build().await?;
+
+        writer.write(batch).await?;
+
+        let data_files = writer.close().await?;
+
+        // now write to the metadata of our table
+        fast_append.add_data_files(data_files).await?;
+        fast_append.apply().await?;
+
+        Ok(())
+    }
 }
 
 fn type_for(sql_type: &DataType) -> Result<PrimitiveType, Error> {
@@ -289,23 +324,6 @@ fn new_memory_catalog() -> Result<MemoryCatalog, Error> {
 #[derive(Debug)]
 struct WalRecover {
     catalog: Arc<dyn Catalog>,
-}
-
-impl LogManager for WalRecover {
-    fn recover(&mut self, _entry: &mut Entry<'_>) -> std::io::Result<()> {
-        //TODO
-        Ok(())
-    }
-
-    fn checkpoint_to(
-        &mut self,
-        _last_checkpointed_id: EntryId,
-        _checkpointed_entries: &mut SegmentReader,
-        _wal: &WriteAheadLog,
-    ) -> std::io::Result<()> {
-        //TODO
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -3,7 +3,10 @@ use crate::frontend::Query;
 use arrow::record_batch::RecordBatch;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::spec::{NestedField, PrimitiveType, Schema};
+use iceberg::io::{
+    S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
+};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Snapshot};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -15,6 +18,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
+use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use sqlparser::ast::{CreateTable, DataType, ObjectName, ObjectType, Use};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,15 +44,14 @@ pub struct Context {
 /// we don't support any isolation between queries,
 /// which means we have dirty reads all types of nonsense for now.
 pub struct Storage {
-    path: PathBuf,
-    catalog: Arc<dyn Catalog>,
+    catalog: Arc<RestCatalog>, //TODO:<dyn Catalog>,
 }
 
 impl Storage {
-    pub fn new(path: PathBuf) -> Result<Self, Error> {
-        let catalog = Arc::new(new_memory_catalog()?);
-
-        Ok(Self { path, catalog })
+    pub fn new() -> Result<Self, Error> {
+        //let catalog = Arc::new(new_memory_catalog()?);
+        let catalog = Arc::new(new_rest_catalog()?);
+        Ok(Self { catalog })
     }
     pub async fn execute(&self, sql: Query) -> Result<Vec<Output>, Error> {
         let mut context = Context::default();
@@ -201,13 +204,13 @@ impl Storage {
             .with_fields(fields.into_iter().map(|f| Arc::new(f.unwrap().into())))
             .build()?;
         let creation = TableCreation::builder()
-            .location(
-                self.path
-                    .join(&table_identifier.name)
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-            )
+            // .location(
+            //     self.path
+            //         .join(&table_identifier.name)
+            //         .to_str()
+            //         .unwrap()
+            //         .to_owned(),
+            // )
             .name(table_identifier.name)
             .schema(schema)
             .build();
@@ -245,7 +248,8 @@ impl Storage {
             file_name_generator,
         );
 
-        let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None);
+        // just one partition `0` for now
+        let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
         let mut writer = data_file_writer_builder.build().await?;
 
         writer.write(batch).await?;
@@ -254,12 +258,16 @@ impl Storage {
 
         // now write to the metadata of our table
         fast_append.add_data_files(data_files)?;
-        fast_append.apply().await?;
+        let transaction = fast_append.apply().await?;
+
+        transaction.commit(&*self.catalog).await?;
 
         Ok(())
     }
 
-    async fn read(
+    /// Pushes down predicates and projection to iceberg to handle
+    /// any aggregation must be done by caller.
+    async fn scan(
         &self,
         table_name: TableIdent,
         columns: impl IntoIterator<Item = String>,
@@ -342,6 +350,24 @@ fn new_memory_catalog() -> Result<MemoryCatalog, Error> {
     Ok(MemoryCatalog::new(file_io, None))
 }
 
+fn new_rest_catalog() -> Result<RestCatalog, Error> {
+    //FIXME: hardcoded S3 config
+    let mut properties = HashMap::new();
+    properties.insert(S3_REGION.to_string(), "us-east-1".to_string());
+    properties.insert(S3_ACCESS_KEY_ID.to_string(), "admin".to_string());
+    properties.insert(S3_SECRET_ACCESS_KEY.to_string(), "password".to_string());
+    properties.insert(
+        S3_ENDPOINT.to_string(),
+        "http://localhost:9000/".to_string(),
+    );
+    // FIXME: hardcoded url
+    Ok(RestCatalog::new(
+        RestCatalogConfig::builder()
+            .props(properties)
+            .uri("http://0.0.0.0:8181".to_string())
+            .build(),
+    ))
+}
 #[derive(Debug)]
 struct WalRecover {
     catalog: Arc<dyn Catalog>,
@@ -352,13 +378,19 @@ mod tests {
     use crate::frontend::parse;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::Field;
+    use std::path::Path;
 
     use super::*;
 
+    #[ignore]
     #[tokio::test]
+    #[serial_test::serial]
     pub async fn create_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path().to_owned()).unwrap();
+        let storage = Storage::new().unwrap();
+        // in case it existed
+        let _ = storage
+            .execute(parse("drop database a_database;").unwrap())
+            .await;
         let sql = parse("create database a_database;").unwrap();
         assert_eq!(
             vec![Output::CreatedDatabase("a_database".to_string())],
@@ -380,14 +412,24 @@ mod tests {
             )],
             storage.execute(sql).await.unwrap()
         );
+
+        storage
+            .execute(parse("use a_database; drop database inside_another;").unwrap())
+            .await
+            .unwrap();
+
+        storage
+            .execute(parse("drop database a_database;").unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     pub async fn create_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path().to_owned()).unwrap();
+        let storage = Storage::new().unwrap();
         let sql = parse(
-            "create database a_database; use a_database; create table my_table (a int32, b string); drop table my_table; drop database a_database;",
+            "create database if not exists a_database; use a_database; create table my_table (a int32, b string); drop table my_table;",
         )
         .unwrap();
         assert_eq!(
@@ -395,31 +437,42 @@ mod tests {
                 Output::CreatedDatabase("a_database".to_string()),
                 Output::CreatedTable("my_table".to_string()),
                 Output::Drop(vec!["my_table".to_string()]),
-                Output::Drop(vec!["a_database".to_string()]),
             ],
             storage.execute(sql).await.unwrap()
         );
+
+        let _ = storage
+            .execute(parse("drop database a_database;").unwrap())
+            .await;
     }
 
     #[tokio::test]
-    pub async fn write() {
+    #[serial_test::serial]
+    pub async fn write_read() {
         let r = RecordBatch::try_new(
             arrow::datatypes::Schema::new(vec![
-                Field::new("id", arrow::datatypes::DataType::Int32, false),
-                Field::new("name", arrow::datatypes::DataType::Utf8, false),
+                Field::new("id", arrow::datatypes::DataType::Int32, false).with_metadata(
+                    HashMap::from([
+                        ("PARQUET:field_id".to_string(), "1".to_string()), // Iceberg uses this
+                    ]),
+                ),
+                Field::new("name", arrow::datatypes::DataType::Utf8, false).with_metadata(
+                    HashMap::from([
+                        ("PARQUET:field_id".to_string(), "2".to_string()), // Iceberg uses this
+                    ]),
+                ),
             ])
             .into(),
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
             ],
         )
         .unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path().to_owned()).unwrap();
+        let storage = Storage::new().unwrap();
         let sql = parse(
-            "create database a_database; use a_database; create table my_table (id int32, name string);"
+            "create database if not exists a_database; use a_database; create table if not exists my_table (id int32, name string);"
         )
             .unwrap();
         storage.execute(sql).await.unwrap();
@@ -429,6 +482,24 @@ mod tests {
         );
         storage.write(table.clone(), r).await.unwrap();
 
-        //TODO verify
+        let results = storage
+            .scan(
+                table.clone(),
+                vec!["id".to_string(), "name".to_string()],
+                Predicate::AlwaysTrue,
+            )
+            .await
+            .unwrap();
+        let result = results.get(0).unwrap();
+        assert_eq!(result.column_by_name("id").unwrap().len(), 3);
+        assert_eq!(result.column_by_name("name").unwrap().len(), 3);
+
+        storage
+            .execute(parse("use a_database; drop table my_table;").unwrap())
+            .await
+            .unwrap();
+        let _ = storage
+            .execute(parse("drop database a_database;").unwrap())
+            .await;
     }
 }

@@ -11,7 +11,7 @@ pub struct Server {
 impl Server {
     pub fn new(storage_path: PathBuf) -> Result<Self, Error> {
         Ok(Self {
-            storage: Storage::new(storage_path)?,
+            storage: Storage::new()?,
         })
     }
 

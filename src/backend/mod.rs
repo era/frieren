@@ -1,20 +1,24 @@
 use crate::error::Error;
 use crate::frontend::Query;
+use arrow::record_batch::RecordBatch;
+use futures_util::{StreamExt, TryStreamExt};
+use iceberg::expr::Predicate;
 use iceberg::spec::{NestedField, PrimitiveType, Schema};
 use iceberg::table::Table;
+use iceberg::transaction::Transaction;
+use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
-use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{CreateTable, DataType, ObjectName, ObjectType, Use};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use iceberg::transaction::Transaction;
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
@@ -216,8 +220,6 @@ impl Storage {
 
     /// Write an Arrow RecordBatch into Table (writes to a parquet file and updates iceberg metadata).
     async fn write(&self, name: TableIdent, batch: RecordBatch) -> Result<(), Error> {
-
-
         // iceberg transaction
         let table = self.catalog.load_table(&name).await?;
         let transaction = Transaction::new(&table);
@@ -228,11 +230,11 @@ impl Storage {
         let location = DefaultLocationGenerator::new(table.metadata().clone())?;
 
         // writing files to parquet first
-        let prefix = format!("{}-{}", name.name,  Uuid::new_v4());
+        let prefix = format!("{}-{}", name.name, Uuid::new_v4());
         let file_name_generator = DefaultFileNameGenerator::new(
             prefix,
-            None, //suffix
-            iceberg::spec::DataFileFormat::Parquet //format
+            None,                                   //suffix
+            iceberg::spec::DataFileFormat::Parquet, //format
         );
         let parquet_props = parquet::file::properties::WriterProperties::builder().build();
         let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -255,6 +257,25 @@ impl Storage {
         fast_append.apply().await?;
 
         Ok(())
+    }
+
+    async fn read(
+        &self,
+        table_name: TableIdent,
+        columns: impl IntoIterator<Item = String>,
+        predicate: Predicate,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let table = self.catalog.load_table(&table_name).await?;
+        let rows = table
+            .scan()
+            .select(columns)
+            .with_filter(predicate)
+            .build()?
+            .to_arrow()
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows)
     }
 }
 
@@ -328,9 +349,9 @@ struct WalRecover {
 
 #[cfg(test)]
 mod tests {
+    use crate::frontend::parse;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::Field;
-    use crate::frontend::parse;
 
     use super::*;
 
@@ -386,12 +407,14 @@ mod tests {
             arrow::datatypes::Schema::new(vec![
                 Field::new("id", arrow::datatypes::DataType::Int32, false),
                 Field::new("name", arrow::datatypes::DataType::Utf8, false),
-            ]).into(),
+            ])
+            .into(),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_owned()).unwrap();
@@ -400,12 +423,12 @@ mod tests {
         )
             .unwrap();
         storage.execute(sql).await.unwrap();
-        let table = TableIdent::new(NamespaceIdent::new("a_database".to_string()), "my_table".to_string());
+        let table = TableIdent::new(
+            NamespaceIdent::new("a_database".to_string()),
+            "my_table".to_string(),
+        );
         storage.write(table.clone(), r).await.unwrap();
 
-
         //TODO verify
-
     }
-
 }

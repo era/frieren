@@ -13,6 +13,8 @@ tokio = { version = "1.44.2", features = ["full"] }
 chrono = "= 0.4.39"
 parquet = "= 53.1.0"
 uuid = "1.16.0"
+futures = "0.3.31"
+futures-util = "0.3.31"
 
 [dev-dependencies]
 tempfile = "3.19.1"

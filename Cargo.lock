@@ -941,6 +941,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "chrono",
+ "futures",
+ "futures-util",
  "iceberg",
  "iceberg-catalog-memory",
  "parquet",

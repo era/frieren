@@ -1,3 +1,6 @@
+use crate::backend::types::{
+    object_name_to_namespace, object_name_to_table, select_item, type_for,
+};
 use crate::error::Error;
 use crate::frontend::Query;
 use arrow::record_batch::RecordBatch;
@@ -25,12 +28,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod types;
+
 #[derive(Debug, PartialEq)]
 pub enum Output {
     CreatedDatabase(String),
     Use(Context),
     CreatedTable(String),
     Drop(Vec<String>),
+    Select(Vec<RecordBatch>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -74,6 +80,9 @@ impl Storage {
         stmt: sqlparser::ast::Statement,
     ) -> Result<Output, Error> {
         match stmt {
+            sqlparser::ast::Statement::Query(query) => {
+                Ok(Output::Select(self.select(query).await?))
+            }
             sqlparser::ast::Statement::CreateDatabase {
                 db_name,
                 if_not_exists,
@@ -102,6 +111,20 @@ impl Storage {
             )),
             e => Err(Error::NotSupportedSql(e.to_string())),
         }
+    }
+
+    async fn select(&self, query: Box<sqlparser::ast::Query>) -> Result<Vec<RecordBatch>, Error> {
+        match *query.body {
+            sqlparser::ast::SetExpr::Select(select) => {
+                //FIXME: not handling joins
+                let table_name = select.from.get(0).cloned().unwrap().relation;
+                let projection: Vec<String> =
+                    select.projection.into_iter().map(select_item).collect();
+                todo!()
+            }
+            _ => unimplemented!(),
+        }
+        todo!()
     }
 
     async fn drop_object(
@@ -285,64 +308,6 @@ impl Storage {
             .await?;
         Ok(rows)
     }
-}
-
-fn type_for(sql_type: &DataType) -> Result<PrimitiveType, Error> {
-    match sql_type {
-        DataType::Boolean | DataType::Bool => Ok(PrimitiveType::Boolean),
-        DataType::Int32 => Ok(PrimitiveType::Int),
-        DataType::Int64 => Ok(PrimitiveType::Long),
-        DataType::Date => Ok(PrimitiveType::Date),
-        DataType::Float32 => Ok(PrimitiveType::Float),
-        DataType::Float64 => Ok(PrimitiveType::Double),
-        DataType::String(_) => Ok(PrimitiveType::String),
-        _ => Err(Error::NotSupportedSql(
-            "column type is not supported".to_string(),
-        )),
-    }
-}
-
-fn object_name_to_namespace(
-    ctx: Context,
-    db_name: sqlparser::ast::ObjectName,
-) -> Result<NamespaceIdent, Error> {
-    // we will create a namespace my_cool_schema with a subnamespace called `my_cool_db`.
-    // FIXME: should look at context to see if the user already used something like `use my_cool_schema;`
-    // FIXME: on previous statements
-    Ok(NamespaceIdent::from_vec(
-        db_name
-            .0
-            .into_iter()
-            // it's safe to unwrap as_indent because as now there will always be one there
-            .map(|i| i.as_ident().unwrap().value.clone())
-            .collect(),
-    )?)
-}
-
-fn object_name_to_table(
-    ctx: Context,
-    table_name: sqlparser::ast::ObjectName,
-) -> Result<TableIdent, Error> {
-    if table_name.0.len() > 1 {
-        return Err(Error::NotSupportedSql(
-            "Syntax schema.table not supported yet".to_string(),
-        ));
-    }
-
-    let namespace = match ctx.namespace {
-                None => return Err(Error::NotSupportedSql("Must first select a database by using `use database` or a schema by using `use schema`".to_string())),
-                Some(namespace) => namespace,
-        };
-
-    Ok(TableIdent::new(
-        namespace.name().clone(),
-        table_name
-            .0
-            .into_iter()
-            // it's safe to unwrap as_indent because as now there will always be one there
-            .map(|i| i.as_ident().unwrap().value.clone())
-            .collect(),
-    ))
 }
 
 fn new_memory_catalog() -> Result<MemoryCatalog, Error> {

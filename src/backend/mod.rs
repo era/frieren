@@ -1,5 +1,6 @@
 use crate::backend::types::{
-    object_name_to_namespace, object_name_to_table, select_item, type_for,
+    expr_predicates, object_name_to_namespace, object_name_to_table, select_item, table_factor,
+    type_for,
 };
 use crate::error::Error;
 use crate::frontend::Query;
@@ -81,7 +82,7 @@ impl Storage {
     ) -> Result<Output, Error> {
         match stmt {
             sqlparser::ast::Statement::Query(query) => {
-                Ok(Output::Select(self.select(query).await?))
+                Ok(Output::Select(self.select(ctx, query).await?))
             }
             sqlparser::ast::Statement::CreateDatabase {
                 db_name,
@@ -113,18 +114,23 @@ impl Storage {
         }
     }
 
-    async fn select(&self, query: Box<sqlparser::ast::Query>) -> Result<Vec<RecordBatch>, Error> {
+    async fn select(
+        &self,
+        ctx: Context,
+        query: Box<sqlparser::ast::Query>,
+    ) -> Result<Vec<RecordBatch>, Error> {
         match *query.body {
             sqlparser::ast::SetExpr::Select(select) => {
                 //FIXME: not handling joins
-                let table_name = select.from.get(0).cloned().unwrap().relation;
+                let table_name =
+                    table_factor(ctx.clone(), select.from.get(0).cloned().unwrap().relation)?;
                 let projection: Vec<String> =
                     select.projection.into_iter().map(select_item).collect();
-                todo!()
+                let predicate = expr_predicates(select.selection);
+                self.scan(table_name, projection, predicate).await
             }
             _ => unimplemented!(),
         }
-        todo!()
     }
 
     async fn drop_object(
@@ -459,6 +465,15 @@ mod tests {
         assert_eq!(result.column_by_name("id").unwrap().len(), 3);
         assert_eq!(result.column_by_name("name").unwrap().len(), 3);
 
+        let select = parse("use a_database; select id from my_table;").unwrap();
+        let result = storage.execute(select).await.unwrap();
+        let result = result.get(0).unwrap();
+        if let Output::Select(results) = result {
+            let result = results.get(0).unwrap();
+            assert_eq!(result.column_by_name("id").unwrap().len(), 3);
+        } else {
+            panic!("should return a select result");
+        }
         storage
             .execute(parse("use a_database; drop table my_table;").unwrap())
             .await

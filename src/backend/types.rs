@@ -1,8 +1,9 @@
 use crate::backend::Context;
 use crate::Error;
+use iceberg::expr::Predicate;
 use iceberg::spec::PrimitiveType;
 use iceberg::{NamespaceIdent, TableIdent};
-use sqlparser::ast::{DataType, Expr, SelectItem};
+use sqlparser::ast::{DataType, Expr, SelectItem, TableFactor};
 
 pub fn type_for(sql_type: &DataType) -> Result<PrimitiveType, Error> {
     match sql_type {
@@ -73,6 +74,22 @@ pub fn select_item(item: SelectItem) -> String {
 pub fn expr(item: Expr) -> String {
     match item {
         Expr::Identifier(identifier) => identifier.value,
+        _ => unimplemented!(),
+    }
+}
+
+//FIXME
+pub fn expr_predicates(expr: Option<Expr>) -> Predicate {
+    if let Some(expr) = expr {
+        unimplemented!()
+    } else {
+        Predicate::AlwaysTrue
+    }
+}
+
+pub fn table_factor(ctx: Context, t: TableFactor) -> Result<TableIdent, Error> {
+    match t {
+        TableFactor::Table { name, .. } => object_name_to_table(ctx, name),
         _ => unimplemented!(),
     }
 }

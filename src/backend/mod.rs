@@ -23,8 +23,8 @@ use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-use sqlparser::ast::{CreateTable, DataType, ObjectName, ObjectType, Use};
-use std::collections::HashMap;
+use sqlparser::ast::{CreateTable, DataType, Expr, ObjectName, ObjectType, Use};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -124,17 +124,42 @@ impl Storage {
                 //FIXME: not handling joins
                 let table_name =
                     table_factor(ctx.clone(), select.from.get(0).cloned().unwrap().relation)?;
-                let projection: Vec<String> = select
+                let projection_final: HashSet<String> = select
                     .projection
                     .into_iter()
                     .map(select_item)
                     .filter_map(Result::ok) // FIXME: horrible, just throw away errors
                     .collect();
-                let predicate = expr_predicates(select.selection);
-                self.scan(table_name, projection, predicate?).await
+                let mut tmp_projection = projection_final.clone();
+                // get all predicates that can be pushed-down to iceberg
+                let predicate = expr_predicates(select.selection.clone(), &mut tmp_projection);
+                //run a table scan to get all relevant items
+                let results = self.scan(table_name, tmp_projection, predicate?).await?;
+                // filter the items which were not possible to do at the iceberg level
+                let results = self.filter(select.selection, results).await?;
+                // finish the projection only using the elements in the select statement
+                self.project(projection_final, results).await
             }
             _ => unimplemented!(),
         }
+    }
+
+    async fn project(
+        &self,
+        columns: HashSet<String>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        //TODO
+        Ok(batches)
+    }
+
+    async fn filter(
+        &self,
+        filters: Option<Expr>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        //TODO
+        Ok(batches)
     }
 
     async fn drop_object(

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::backend::Context;
 use crate::Error;
 use iceberg::expr::BinaryExpression;
@@ -81,17 +83,31 @@ pub fn expr(item: Expr) -> Result<String, Error> {
         ))),
     }
 }
+/// Transforms all expr into predicates to be pushed-down to iceberg catalog
+/// it also add columns to projection if we need to use them as a filter
+/// later on.
 //FIXME
-pub fn expr_predicates(exp: Option<Expr>) -> Result<Predicate, Error> {
+pub fn expr_predicates(
+    exp: Option<Expr>,
+    projection: &mut HashSet<String>,
+) -> Result<Predicate, Error> {
     if let Some(exp) = exp {
         match exp {
             // FIXME: this are only for push-down filters (with literals),
             // and assuming users will write column_name op literal
-            Expr::BinaryOp { left, op, right } => Ok(Predicate::Binary(BinaryExpression::new(
-                predicate_operator(op)?,
-                Reference::new(expr(*left)?),
-                expr_datum(*right)?,
-            ))),
+            Expr::BinaryOp { left, op, right } => {
+                if let Expr::Value(v) = *right {
+                    Ok(Predicate::Binary(BinaryExpression::new(
+                        predicate_operator(op)?,
+                        Reference::new(expr(*left)?),
+                        value_datum(v.value)?,
+                    )))
+                } else {
+                    //FIXME for now only supporting either a literal or a column id
+                    projection.insert(expr(*right)?);
+                    Ok(Predicate::AlwaysTrue)
+                }
+            }
             _ => unimplemented!(),
         }
     } else {
@@ -99,20 +115,13 @@ pub fn expr_predicates(exp: Option<Expr>) -> Result<Predicate, Error> {
     }
 }
 
-pub fn expr_datum(exp: Expr) -> Result<Datum, Error> {
-    if let Expr::Value(v) = exp {
-        match v.value {
-            //FIXME: unwrap
-            Value::Number(n, _) => Ok(Datum::double(n.parse::<f64>().unwrap())),
-            Value::Boolean(t) => Ok(Datum::bool(t)),
-            Value::DoubleQuotedString(s) => Ok(Datum::string(s)),
-            _ => Err(Error::NotSupportedSql(format!("value {} not supported", v))),
-        }
-    } else {
-        Err(Error::NotSupportedSql(format!(
-            "expecting literal, got {}",
-            exp
-        )))
+pub fn value_datum(v: Value) -> Result<Datum, Error> {
+    match v {
+        //FIXME: unwrap
+        Value::Number(n, _) => Ok(Datum::double(n.parse::<f64>().unwrap())),
+        Value::Boolean(t) => Ok(Datum::bool(t)),
+        Value::DoubleQuotedString(s) => Ok(Datum::string(s)),
+        _ => Err(Error::NotSupportedSql(format!("value {} not supported", v))),
     }
 }
 

@@ -124,10 +124,14 @@ impl Storage {
                 //FIXME: not handling joins
                 let table_name =
                     table_factor(ctx.clone(), select.from.get(0).cloned().unwrap().relation)?;
-                let projection: Vec<String> =
-                    select.projection.into_iter().map(select_item).collect();
+                let projection: Vec<String> = select
+                    .projection
+                    .into_iter()
+                    .map(select_item)
+                    .filter_map(Result::ok) // FIXME: horrible, just throw away errors
+                    .collect();
                 let predicate = expr_predicates(select.selection);
-                self.scan(table_name, projection, predicate).await
+                self.scan(table_name, projection, predicate?).await
             }
             _ => unimplemented!(),
         }

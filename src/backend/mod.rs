@@ -4,6 +4,7 @@ use crate::backend::types::{
 };
 use crate::error::Error;
 use crate::frontend::Query;
+use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -29,7 +30,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod arrow_helper;
 mod types;
+
+//FIXME: Currently does not properly supports different types of numbers
+// while querying.
 
 #[derive(Debug, PartialEq)]
 pub enum Output {
@@ -158,8 +163,17 @@ impl Storage {
         filters: Option<Expr>,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, Error> {
-        //TODO
-        Ok(batches)
+        // merging all the batches to be easier to handle this
+        if let Some(batch) = batches.get(0) {
+            let schema = batch.schema();
+            let batch = concat_batches(&schema, &batches)?;
+            if let Some(filters) = filters {
+                return Ok(vec![arrow_helper::filter_record_batch(&batch, &filters)?]);
+            }
+            Ok(vec![batch])
+        } else {
+            Ok(vec![])
+        }
     }
 
     async fn drop_object(
@@ -494,7 +508,7 @@ mod tests {
         assert_eq!(result.column_by_name("id").unwrap().len(), 3);
         assert_eq!(result.column_by_name("name").unwrap().len(), 3);
 
-        let select = parse("use a_database; select id from my_table;").unwrap();
+        let select = parse("use a_database; select id from my_table where id = id;").unwrap();
         let result = storage.execute(select).await.unwrap();
         let result = result.get(0).unwrap();
         if let Output::Select(results) = result {

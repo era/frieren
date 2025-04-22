@@ -117,10 +117,19 @@ pub fn expr_predicates(
 
 pub fn value_datum(v: Value) -> Result<Datum, Error> {
     match v {
-        //FIXME: unwrap
-        Value::Number(n, _) => Ok(Datum::double(n.parse::<f64>().unwrap())),
+        //FIXME: unwrap and not properly handling all numbers
+        // we should get the type of the number from the schema.
+        Value::Number(n, _) => {
+            if let Ok(int_val) = n.parse::<i32>() {
+                Ok(Datum::int(int_val))
+            } else if let Ok(float_val) = n.parse::<f64>() {
+                Ok(Datum::double(float_val))
+            } else {
+                Err(Error::NotSupportedSql("not supported number".to_string()))
+            }
+        }
         Value::Boolean(t) => Ok(Datum::bool(t)),
-        Value::DoubleQuotedString(s) => Ok(Datum::string(s)),
+        Value::DoubleQuotedString(s) | Value::SingleQuotedString(s) => Ok(Datum::string(s)),
         _ => Err(Error::NotSupportedSql(format!("value {} not supported", v))),
     }
 }

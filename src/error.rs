@@ -1,3 +1,5 @@
+use arrow::error::ArrowError;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to parse sql: {0}")]
@@ -17,4 +19,7 @@ pub enum Error {
 
     #[error("Item does not exist: {0}")]
     NotPossibletoDrop(String),
+
+    #[error("Error while using Arrow: {0}")]
+    ArrowError(#[from] ArrowError),
 }

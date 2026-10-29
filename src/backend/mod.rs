@@ -1,11 +1,10 @@
 use crate::backend::types::{
-    expr_predicates, object_name_to_namespace, object_name_to_table, select_item, table_factor,
-    type_for,
+    object_name_to_namespace, object_name_to_table, table_factor, type_for,
 };
 use crate::error::Error;
-use arrow::compute::concat_batches;
+use crate::plan::Binder;
 use arrow::record_batch::RecordBatch;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use iceberg::expr::Predicate;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
@@ -23,13 +22,13 @@ use iceberg::{io::FileIOBuilder, Catalog};
 use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-use sqlparser::ast::{CreateTable, DataType, Expr, ObjectName, ObjectType, Use};
-use std::collections::{HashMap, HashSet};
+use sqlparser::ast::{CreateTable, ObjectName, ObjectType, Use};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-mod arrow_helper;
+mod eval;
 mod types;
 
 //FIXME: Currently does not properly supports different types of numbers
@@ -124,56 +123,68 @@ impl Storage {
         ctx: Context,
         query: Box<sqlparser::ast::Query>,
     ) -> Result<Vec<RecordBatch>, Error> {
-        match *query.body {
-            sqlparser::ast::SetExpr::Select(select) => {
-                //FIXME: not handling joins
-                let table_name =
-                    table_factor(ctx.clone(), select.from.get(0).cloned().unwrap().relation)?;
-                let projection_final: HashSet<String> = select
-                    .projection
-                    .into_iter()
-                    .map(select_item)
-                    .filter_map(Result::ok) // FIXME: horrible, just throw away errors
-                    .collect();
-                let mut tmp_projection = projection_final.clone();
-                // get all predicates that can be pushed-down to iceberg
-                let predicate = expr_predicates(select.selection.clone(), &mut tmp_projection);
-                //run a table scan to get all relevant items
-                let results = self.scan(table_name, tmp_projection, predicate?).await?;
-                // filter the items which were not possible to do at the iceberg level
-                let results = self.filter(select.selection, results).await?;
-                // finish the projection only using the elements in the select statement
-                self.project(projection_final, results).await
+        let select = match query.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(select) => select,
+            _ => {
+                return Err(Error::NotSupportedSql(
+                    "only a plain SELECT is supported".to_string(),
+                ))
             }
-            _ => unimplemented!(),
+        };
+        if select.from.len() != 1 {
+            return Err(Error::NotSupportedSql(
+                "exactly one FROM table is supported".to_string(),
+            ));
         }
-    }
 
-    async fn project(
-        &self,
-        columns: HashSet<String>,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, Error> {
-        //TODO
-        Ok(batches)
-    }
+        let table_name = table_factor(ctx, select.from[0].relation.clone())?;
+        let table = self.catalog.load_table(&table_name).await?;
 
-    async fn filter(
-        &self,
-        filters: Option<Expr>,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, Error> {
-        // merging all the batches to be easier to handle this
-        if let Some(batch) = batches.get(0) {
-            let schema = batch.schema();
-            let batch = concat_batches(&schema, &batches)?;
-            if let Some(filters) = filters {
-                return Ok(vec![arrow_helper::filter_record_batch(&batch, &filters)?]);
-            }
-            Ok(vec![batch])
-        } else {
-            Ok(vec![])
+        // Pin the snapshot and schema once; binding and execution must agree.
+        let metadata = table.metadata();
+        let snapshot_id = metadata.current_snapshot_id();
+        let schema = match snapshot_id {
+            Some(snapshot_id) => metadata
+                .snapshot_by_id(snapshot_id)
+                .ok_or_else(|| Error::NotSupportedSql(format!("snapshot {snapshot_id} not found")))?
+                .schema(metadata)?,
+            None => metadata.current_schema().clone(),
+        };
+
+        let plan = Binder::new(table_name, &schema, snapshot_id).bind(&query)?;
+
+        let columns: Vec<&str> = plan
+            .scan
+            .projection
+            .iter()
+            .map(|field_id| {
+                schema.name_by_field_id(*field_id).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "planned field id {field_id} is missing from the pinned schema"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let batches = self
+            .scan_table(
+                &table,
+                plan.scan.snapshot_id,
+                columns,
+                plan.scan.predicate.clone().unwrap_or(Predicate::AlwaysTrue),
+            )
+            .await?;
+
+        // Iceberg handled the pushed-down predicate; apply the residual and
+        // then reduce to the user's projection, in SQL order.
+        let mut results = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let batch = match &plan.scan.residual {
+                Some(residual) => eval::filter_record_batch(&batch, residual)?,
+                None => batch,
+            };
+            results.push(eval::project_output(&batch, &plan.output)?);
         }
+        Ok(results)
     }
 
     async fn drop_object(
@@ -346,8 +357,21 @@ impl Storage {
         predicate: Predicate,
     ) -> Result<Vec<RecordBatch>, Error> {
         let table = self.catalog.load_table(&table_name).await?;
-        let rows = table
-            .scan()
+        self.scan_table(&table, None, columns, predicate).await
+    }
+
+    async fn scan_table(
+        &self,
+        table: &Table,
+        snapshot_id: Option<i64>,
+        columns: impl IntoIterator<Item = impl ToString>,
+        predicate: Predicate,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let mut scan = table.scan();
+        if let Some(snapshot_id) = snapshot_id {
+            scan = scan.snapshot_id(snapshot_id);
+        }
+        let rows = scan
             .select(columns)
             .with_filter(predicate)
             .build()?
@@ -389,10 +413,29 @@ struct WalRecover {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, Int32Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::Field;
 
     use super::*;
+
+    fn test_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            arrow::datatypes::Schema::new(vec![
+                Field::new("id", arrow::datatypes::DataType::Int32, false).with_metadata(
+                    HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())]),
+                ),
+                Field::new("name", arrow::datatypes::DataType::Utf8, false).with_metadata(
+                    HashMap::from([("PARQUET:field_id".to_string(), "2".to_string())]),
+                ),
+            ])
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
 
     #[ignore]
     #[tokio::test]
@@ -451,26 +494,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     pub async fn write_read() {
-        let r = RecordBatch::try_new(
-            arrow::datatypes::Schema::new(vec![
-                Field::new("id", arrow::datatypes::DataType::Int32, false).with_metadata(
-                    HashMap::from([
-                        ("PARQUET:field_id".to_string(), "1".to_string()), // Iceberg uses this
-                    ]),
-                ),
-                Field::new("name", arrow::datatypes::DataType::Utf8, false).with_metadata(
-                    HashMap::from([
-                        ("PARQUET:field_id".to_string(), "2".to_string()), // Iceberg uses this
-                    ]),
-                ),
-            ])
-            .into(),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
-            ],
-        )
-        .unwrap();
+        let r = test_batch();
 
         let storage = Storage::new().unwrap();
         let sql = "create database if not exists a_database; use a_database; create table if not exists my_table (id int32, name string);";
@@ -493,19 +517,124 @@ mod tests {
         assert_eq!(result.column_by_name("id").unwrap().len(), 3);
         assert_eq!(result.column_by_name("name").unwrap().len(), 3);
 
-        let select = "use a_database; select id from my_table where id = id;";
+        let select = "use a_database; select id, name from my_table;";
         let result = storage.execute(select).await.unwrap();
-        let result = result.get(0).unwrap();
-        if let Output::Select(results) = result {
-            let result = results.get(0).unwrap();
-            assert_eq!(result.column_by_name("id").unwrap().len(), 3);
-        } else {
-            panic!("should return a select result");
-        }
+        let result = match result.get(0).unwrap() {
+            Output::Select(results) => results.get(0).unwrap(),
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.schema().field(0).name(), "id");
+        assert_eq!(result.schema().field(1).name(), "name");
+        assert_eq!(result.num_rows(), 3);
+
+        // The filter column is pushed down and is not part of the output or the scan projection.
+        let select = "use a_database; select name from my_table where id = 4;";
+        let result = storage.execute(select).await.unwrap();
+        let result = match result.get(0).unwrap() {
+            Output::Select(results) => results.get(0).unwrap(),
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(result.num_columns(), 1);
+        assert!(result.column_by_name("id").is_none());
+        let names = result
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names.value(0), "a");
+
+        // A residual filter keeps its input column for filtering but not for output.
+        let select = "use a_database; select name from my_table where id = id;";
+        let result = storage.execute(select).await.unwrap();
+        let result = match result.get(0).unwrap() {
+            Output::Select(results) => results.get(0).unwrap(),
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(result.num_columns(), 1);
+        assert!(result.column_by_name("id").is_none());
+        assert_eq!(result.column_by_name("name").unwrap().len(), 3);
+
+        let select = "use a_database; select * from my_table where id = id;";
+        let result = storage.execute(select).await.unwrap();
+        let result = match result.get(0).unwrap() {
+            Output::Select(results) => results.get(0).unwrap(),
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.schema().field(0).name(), "id");
+        assert_eq!(result.schema().field(1).name(), "name");
         storage
             .execute("use a_database; drop table my_table;")
             .await
             .unwrap();
         let _ = storage.execute("drop database a_database;").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    pub async fn multi_file_select() {
+        let storage = Storage::new().unwrap();
+        let _ = storage.execute("use multi_file_db; drop table t;").await;
+        let _ = storage.execute("drop database multi_file_db;").await;
+        storage
+            .execute("create database multi_file_db; use multi_file_db; create table t (id int32, name string);")
+            .await
+            .unwrap();
+
+        let table = TableIdent::new(
+            NamespaceIdent::new("multi_file_db".to_string()),
+            "t".to_string(),
+        );
+        storage.write(table.clone(), test_batch()).await.unwrap();
+        storage.write(table.clone(), test_batch()).await.unwrap();
+
+        let output = storage
+            .execute("use multi_file_db; select name from t where id = 4;")
+            .await
+            .unwrap();
+        let batches = match output.get(0).unwrap() {
+            Output::Select(batches) => batches,
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            2
+        );
+        for batch in batches {
+            assert_eq!(batch.num_columns(), 1);
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..names.len() {
+                assert_eq!(names.value(row), "a");
+            }
+        }
+
+        let output = storage
+            .execute("use multi_file_db; select id, name from t;")
+            .await
+            .unwrap();
+        let batches = match output.get(0).unwrap() {
+            Output::Select(batches) => batches,
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            6
+        );
+        assert_eq!(batches[0].schema().field(0).name(), "id");
+        assert_eq!(batches[0].schema().field(1).name(), "name");
+
+        storage
+            .execute("use multi_file_db; drop table t;")
+            .await
+            .unwrap();
+        let _ = storage.execute("drop database multi_file_db;").await;
     }
 }

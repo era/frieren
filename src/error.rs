@@ -22,4 +22,10 @@ pub enum Error {
 
     #[error("Error while using Arrow: {0}")]
     ArrowError(#[from] ArrowError),
+
+    #[error("failed to bind query: {0}")]
+    Bind(#[from] crate::BindError),
+
+    #[error("internal execution error: {0}")]
+    Internal(String),
 }

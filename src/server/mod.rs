@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use crate::backend::Storage;
 use crate::error::Error;
-use crate::frontend::parse;
 
 pub struct Server {
     storage: Storage,
@@ -16,8 +15,7 @@ impl Server {
     }
 
     pub async fn execute(&self, sql: String) -> Result<(), Error> {
-        let stmts = parse(&sql)?;
-        let _result = self.storage.execute(stmts).await?;
+        let _result = self.storage.execute(&sql).await?;
         todo!()
     }
 }

@@ -3,7 +3,6 @@ use crate::backend::types::{
     type_for,
 };
 use crate::error::Error;
-use crate::frontend::Query;
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use futures_util::{StreamExt, TryStreamExt};
@@ -65,10 +64,11 @@ impl Storage {
         let catalog = Arc::new(new_rest_catalog()?);
         Ok(Self { catalog })
     }
-    pub async fn execute(&self, sql: Query) -> Result<Vec<Output>, Error> {
+    pub async fn execute(&self, sql: &str) -> Result<Vec<Output>, Error> {
+        let stmts = crate::parse(sql)?;
         let mut context = Context::default();
-        let mut results = Vec::with_capacity(sql.stmts.len());
-        for stmt in sql.stmts {
+        let mut results = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
             let result = self.execute_stmt(context.clone(), stmt).await?;
             // if the previous statement was a `use` we should start using that namespace
             if let Output::Use(ctx) = result {
@@ -389,10 +389,8 @@ struct WalRecover {
 
 #[cfg(test)]
 mod tests {
-    use crate::frontend::parse;
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::Field;
-    use std::path::Path;
 
     use super::*;
 
@@ -402,24 +400,22 @@ mod tests {
     pub async fn create_database() {
         let storage = Storage::new().unwrap();
         // in case it existed
-        let _ = storage
-            .execute(parse("drop database a_database;").unwrap())
-            .await;
-        let sql = parse("create database a_database;").unwrap();
+        let _ = storage.execute("drop database a_database;").await;
+        let sql = "create database a_database;";
         assert_eq!(
             vec![Output::CreatedDatabase("a_database".to_string())],
             storage.execute(sql).await.unwrap()
         );
 
-        let sql = parse("create database if not exists a_database;").unwrap();
+        let sql = "create database if not exists a_database;";
         assert_eq!(
             vec![Output::CreatedDatabase("a_database".to_string())],
             storage.execute(sql).await.unwrap()
         );
-        let sql = parse("create database a_database;").unwrap();
+        let sql = "create database a_database;";
         assert!(storage.execute(sql).await.is_err());
 
-        let sql = parse("create database a_database.inside_another;").unwrap();
+        let sql = "create database a_database.inside_another;";
         assert_eq!(
             vec![Output::CreatedDatabase(
                 "a_database\u{1f}inside_another".to_string()
@@ -428,24 +424,18 @@ mod tests {
         );
 
         storage
-            .execute(parse("use a_database; drop database inside_another;").unwrap())
+            .execute("use a_database; drop database inside_another;")
             .await
             .unwrap();
 
-        storage
-            .execute(parse("drop database a_database;").unwrap())
-            .await
-            .unwrap();
+        storage.execute("drop database a_database;").await.unwrap();
     }
 
     #[tokio::test]
     #[serial_test::serial]
     pub async fn create_drop() {
         let storage = Storage::new().unwrap();
-        let sql = parse(
-            "create database if not exists a_database; use a_database; create table my_table (a int32, b string); drop table my_table;",
-        )
-        .unwrap();
+        let sql = "create database if not exists a_database; use a_database; create table my_table (a int32, b string); drop table my_table;";
         assert_eq!(
             vec![
                 Output::CreatedDatabase("a_database".to_string()),
@@ -455,9 +445,7 @@ mod tests {
             storage.execute(sql).await.unwrap()
         );
 
-        let _ = storage
-            .execute(parse("drop database a_database;").unwrap())
-            .await;
+        let _ = storage.execute("drop database a_database;").await;
     }
 
     #[tokio::test]
@@ -485,10 +473,7 @@ mod tests {
         .unwrap();
 
         let storage = Storage::new().unwrap();
-        let sql = parse(
-            "create database if not exists a_database; use a_database; create table if not exists my_table (id int32, name string);"
-        )
-            .unwrap();
+        let sql = "create database if not exists a_database; use a_database; create table if not exists my_table (id int32, name string);";
         storage.execute(sql).await.unwrap();
         let table = TableIdent::new(
             NamespaceIdent::new("a_database".to_string()),
@@ -508,7 +493,7 @@ mod tests {
         assert_eq!(result.column_by_name("id").unwrap().len(), 3);
         assert_eq!(result.column_by_name("name").unwrap().len(), 3);
 
-        let select = parse("use a_database; select id from my_table where id = id;").unwrap();
+        let select = "use a_database; select id from my_table where id = id;";
         let result = storage.execute(select).await.unwrap();
         let result = result.get(0).unwrap();
         if let Output::Select(results) = result {
@@ -518,11 +503,9 @@ mod tests {
             panic!("should return a select result");
         }
         storage
-            .execute(parse("use a_database; drop table my_table;").unwrap())
+            .execute("use a_database; drop table my_table;")
             .await
             .unwrap();
-        let _ = storage
-            .execute(parse("drop database a_database;").unwrap())
-            .await;
+        let _ = storage.execute("drop database a_database;").await;
     }
 }

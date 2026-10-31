@@ -4,8 +4,8 @@ use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference};
 use iceberg::spec::{Datum, NestedField, PrimitiveLiteral, PrimitiveType, Schema, Type};
 use iceberg::TableIdent;
 use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, Ident, Query, Select, SelectItem, SetExpr, UnaryOperator,
-    Value, WildcardAdditionalOptions,
+    BinaryOperator, Expr, GroupByExpr, Ident, Insert, Query, Select, SelectItem, SetExpr,
+    TableObject, UnaryOperator, Value, WildcardAdditionalOptions,
 };
 
 /// Errors produced while resolving a SQL query against an Iceberg schema.
@@ -28,6 +28,18 @@ pub enum BindError {
 
     #[error("literal `{value}` is not valid for type `{target}`")]
     InvalidLiteral { value: String, target: String },
+
+    #[error("INSERT row has {found} values but {expected} columns were specified")]
+    RowArity { expected: usize, found: usize },
+
+    #[error("column `{0}` appears more than once in INSERT")]
+    DuplicateColumn(String),
+
+    #[error("column `{0}` is required and cannot be omitted or set to NULL")]
+    RequiredColumn(String),
+
+    #[error("INSERT is not supported yet: {0}")]
+    UnsupportedInsert(String),
 }
 
 /// A resolved output column. The name is the schema name; aliases are not bound yet.
@@ -147,6 +159,16 @@ pub struct BoundPlan {
     pub output: Vec<OutputColumn>,
 }
 
+/// A resolved `INSERT ... VALUES`. Values are already coerced to column types.
+#[derive(Debug, Clone)]
+pub struct BoundInsert {
+    pub table: TableIdent,
+    /// Target field IDs in row order.
+    pub columns: Vec<i32>,
+    /// One vector per row; `None` is SQL NULL.
+    pub rows: Vec<Vec<Option<Datum>>>,
+}
+
 /// Resolves a `SELECT` against one pinned Iceberg schema.
 pub struct Binder<'a> {
     table: TableIdent,
@@ -187,6 +209,111 @@ impl<'a> Binder<'a> {
             _ => return unsupported("only a plain SELECT is supported"),
         };
         self.bind_select(select)
+    }
+
+    pub fn bind_insert(self, insert: &Insert) -> Result<BoundInsert, BindError> {
+        validate_insert(insert)?;
+        let query = insert
+            .source
+            .as_deref()
+            .ok_or_else(|| BindError::UnsupportedInsert("missing VALUES".to_string()))?;
+        validate_insert_query(query)?;
+        let values = match query.body.as_ref() {
+            SetExpr::Values(values) => values,
+            _ => {
+                return Err(BindError::UnsupportedInsert(
+                    "INSERT ... SELECT".to_string(),
+                ))
+            }
+        };
+
+        let target_fields = self.insert_target_fields(insert)?;
+        let table = self.table.clone();
+        let mut rows = Vec::with_capacity(values.rows.len());
+        for row in &values.rows {
+            if row.len() != target_fields.len() {
+                return Err(BindError::RowArity {
+                    expected: target_fields.len(),
+                    found: row.len(),
+                });
+            }
+            let mut bound_row = Vec::with_capacity(row.len());
+            for (expr, field) in row.iter().zip(&target_fields) {
+                bound_row.push(self.bind_insert_value(expr, field)?);
+            }
+            rows.push(bound_row);
+        }
+
+        for field in self.schema.as_struct().fields() {
+            if field.required && !target_fields.iter().any(|target| target.id == field.id) {
+                return Err(BindError::RequiredColumn(field.name.clone()));
+            }
+        }
+
+        Ok(BoundInsert {
+            table,
+            columns: target_fields.iter().map(|field| field.id).collect(),
+            rows,
+        })
+    }
+
+    fn insert_target_fields(&self, insert: &Insert) -> Result<Vec<&NestedField>, BindError> {
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+
+        if insert.columns.is_empty() {
+            fields.extend(
+                self.schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref()),
+            );
+        } else {
+            for ident in &insert.columns {
+                let field = self.resolve_field(ident)?;
+                if !seen.insert(field.id) {
+                    return Err(BindError::DuplicateColumn(field.name.clone()));
+                }
+                fields.push(field);
+            }
+        }
+
+        for field in &fields {
+            if !matches!(field.field_type.as_ref(), Type::Primitive(_)) {
+                return Err(BindError::UnsupportedType(format!(
+                    "{:?}",
+                    field.field_type
+                )));
+            }
+        }
+        Ok(fields)
+    }
+
+    fn bind_insert_value(
+        &self,
+        expr: &Expr,
+        field: &NestedField,
+    ) -> Result<Option<Datum>, BindError> {
+        let data_type = match field.field_type.as_ref() {
+            Type::Primitive(data_type) => data_type,
+            other => return Err(BindError::UnsupportedType(format!("{other:?}"))),
+        };
+
+        if matches!(expr, Expr::Value(value) if matches!(value.value, Value::Null)) {
+            return if field.required {
+                Err(BindError::RequiredColumn(field.name.clone()))
+            } else {
+                Ok(None)
+            };
+        }
+
+        match self.bind_expr(expr)? {
+            BoundExpr::Literal(datum) => Ok(Some(coerce_literal(datum, data_type)?)),
+            _ => Err(BindError::UnsupportedInsert(
+                "INSERT values must be literals".to_string(),
+            )),
+        }
     }
 
     fn bind_select(self, select: &Select) -> Result<BoundPlan, BindError> {
@@ -254,17 +381,21 @@ impl<'a> Binder<'a> {
     }
 
     fn resolve_ident(&self, ident: &Ident) -> Result<BoundExpr, BindError> {
-        let field = if ident.quote_style.is_some() {
+        let field = self.resolve_field(ident)?;
+        self.column_for_field(field)
+    }
+
+    fn resolve_field(&self, ident: &Ident) -> Result<&NestedField, BindError> {
+        if ident.quote_style.is_some() {
             self.schema.field_by_name(&ident.value)
         } else {
             self.schema.field_by_name_case_insensitive(&ident.value)
         }
+        .map(|field| field.as_ref())
         .ok_or_else(|| BindError::UnknownColumn {
             column: ident.value.clone(),
             table: self.table.to_string(),
-        })?;
-
-        self.column_for_field(field)
+        })
     }
 
     fn column_for_field(&self, field: &NestedField) -> Result<BoundExpr, BindError> {
@@ -373,6 +504,52 @@ impl<'a> Binder<'a> {
             right: Box::new(right),
         })
     }
+}
+
+fn validate_insert(insert: &Insert) -> Result<(), BindError> {
+    if insert.or.is_some()
+        || insert.ignore
+        || insert.overwrite
+        || insert.table_alias.is_some()
+        || !insert.assignments.is_empty()
+        || insert.partitioned.is_some()
+        || !insert.after_columns.is_empty()
+        || insert.has_table_keyword
+        || insert.on.is_some()
+        || insert.returning.is_some()
+        || insert.replace_into
+        || insert.priority.is_some()
+        || insert.insert_alias.is_some()
+        || insert.settings.is_some()
+        || insert.format_clause.is_some()
+    {
+        return Err(BindError::UnsupportedInsert("INSERT option".to_string()));
+    }
+    if !matches!(&insert.table, TableObject::TableName(_)) {
+        return Err(BindError::UnsupportedInsert(
+            "INSERT target must be a table".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_insert_query(query: &Query) -> Result<(), BindError> {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit.is_some()
+        || !query.limit_by.is_empty()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
+        return Err(BindError::UnsupportedInsert(
+            "INSERT query clause".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_select(select: &Select) -> Result<(), BindError> {
@@ -668,7 +845,7 @@ mod tests {
                     "name",
                     Type::Primitive(PrimitiveType::String),
                 )),
-                Arc::new(NestedField::required(
+                Arc::new(NestedField::optional(
                     3,
                     "big",
                     Type::Primitive(PrimitiveType::Long),
@@ -784,5 +961,70 @@ mod tests {
         assert!(bind("select name from t order by id").is_err());
         assert!(bind("select count(*) from t").is_err());
         assert!(bind("select name from t group by name").is_err());
+    }
+
+    fn bind_insert(sql: &str) -> Result<BoundInsert, BindError> {
+        let statements = crate::parse(sql).unwrap();
+        let insert = match &statements[0] {
+            Statement::Insert(insert) => insert,
+            other => panic!("expected an insert, got {other:?}"),
+        };
+        let schema = schema();
+        Binder::new(
+            TableIdent::new(
+                iceberg::NamespaceIdent::new("db".to_string()),
+                "t".to_string(),
+            ),
+            &schema,
+            Some(7),
+        )
+        .bind_insert(insert)
+    }
+
+    #[test]
+    fn binds_insert_values_to_field_ids() {
+        let insert = bind_insert("insert into t (id, name) values (10, 'x'), (11, 'y')").unwrap();
+        assert_eq!(insert.columns, vec![1, 2]);
+        assert_eq!(insert.rows.len(), 2);
+        assert_eq!(insert.rows[0][0], Some(Datum::int(10)));
+        assert_eq!(insert.rows[0][1], Some(Datum::string("x")));
+        assert_eq!(insert.rows[1][0], Some(Datum::int(11)));
+    }
+
+    #[test]
+    fn insert_allows_null_for_optional_columns() {
+        let insert = bind_insert("insert into t (id, name, big) values (1, 'x', null)").unwrap();
+        assert_eq!(insert.columns, vec![1, 2, 3]);
+        assert_eq!(insert.rows[0][2], None);
+    }
+
+    #[test]
+    fn insert_rejects_null_for_required_columns() {
+        let error = bind_insert("insert into t (id) values (null)").unwrap_err();
+        assert!(matches!(error, BindError::RequiredColumn(_)));
+    }
+
+    #[test]
+    fn insert_rejects_wrong_arity() {
+        let error = bind_insert("insert into t (id, name) values (1)").unwrap_err();
+        assert!(matches!(error, BindError::RowArity { .. }));
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_columns() {
+        let error = bind_insert("insert into t (id, id) values (1, 2)").unwrap_err();
+        assert!(matches!(error, BindError::DuplicateColumn(_)));
+    }
+
+    #[test]
+    fn insert_rejects_select_source() {
+        let error = bind_insert("insert into t (id) select id from t").unwrap_err();
+        assert!(matches!(error, BindError::UnsupportedInsert(_)));
+    }
+
+    #[test]
+    fn insert_coerces_literals() {
+        let insert = bind_insert("insert into t (id, name, big) values (1, 'x', 2)").unwrap();
+        assert_eq!(insert.rows[0][2], Some(Datum::long(2)));
     }
 }

@@ -1,15 +1,15 @@
 use crate::backend::types::{
     object_name_to_namespace, object_name_to_table, table_factor, type_for,
 };
+use crate::backend::write::{align_batch, build_insert_batch, parquet_writer_properties};
 use crate::error::Error;
 use crate::plan::Binder;
 use arrow::record_batch::RecordBatch;
 use futures_util::TryStreamExt;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::expr::Predicate;
-use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
-};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Snapshot};
+use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
+use iceberg::spec::{DataFile, NestedField, Schema};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -19,17 +19,17 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{io::FileIOBuilder, Catalog};
-use iceberg::{Namespace, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{Namespace, TableCreation, TableIdent};
 use iceberg_catalog_memory::MemoryCatalog;
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use sqlparser::ast::{CreateTable, ObjectName, ObjectType, Use};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
 mod eval;
 mod types;
+mod write;
 
 //FIXME: Currently does not properly supports different types of numbers
 // while querying.
@@ -40,6 +40,7 @@ pub enum Output {
     Use(Context),
     CreatedTable(String),
     Drop(Vec<String>),
+    Inserted { table: String, rows: usize },
     Select(Vec<RecordBatch>),
 }
 
@@ -106,6 +107,7 @@ impl Storage {
                     .name
                     .clone(),
             )),
+            sqlparser::ast::Statement::Insert(insert) => Ok(self.insert(ctx, insert).await?),
             sqlparser::ast::Statement::Drop {
                 object_type,
                 if_exists,
@@ -185,6 +187,36 @@ impl Storage {
             results.push(eval::project_output(&batch, &plan.output)?);
         }
         Ok(results)
+    }
+
+    async fn insert(&self, ctx: Context, insert: sqlparser::ast::Insert) -> Result<Output, Error> {
+        let name = match &insert.table {
+            sqlparser::ast::TableObject::TableName(name) => name.clone(),
+            _ => {
+                return Err(Error::NotSupportedSql(
+                    "only INSERT INTO table is supported".to_string(),
+                ))
+            }
+        };
+        let table_name = object_name_to_table(ctx, name)?;
+        let table = self.catalog.load_table(&table_name).await?;
+        let schema = table.metadata().current_schema().clone();
+
+        let plan = Binder::new(
+            table_name.clone(),
+            &schema,
+            table.metadata().current_snapshot_id(),
+        )
+        .bind_insert(&insert)?;
+        let arrow_schema = schema_to_arrow_schema(&schema)?;
+        let batch = build_insert_batch(&schema, &arrow_schema, &plan.columns, &plan.rows)?;
+        let rows = batch.num_rows();
+
+        self.write(plan.table, vec![batch]).await?;
+        Ok(Output::Inserted {
+            table: table_name.name,
+            rows,
+        })
     }
 
     async fn drop_object(
@@ -304,48 +336,88 @@ impl Storage {
             .await?)
     }
 
-    /// Write an Arrow RecordBatch into Table (writes to a parquet file and updates iceberg metadata).
-    async fn write(&self, name: TableIdent, batch: RecordBatch) -> Result<(), Error> {
-        // iceberg transaction
-        let table = self.catalog.load_table(&name).await?;
-        let transaction = Transaction::new(&table);
-        let mut fast_append = transaction.fast_append(None, vec![])?;
+    /// Writes Arrow batches into a table. One call is one Iceberg transaction.
+    async fn write(&self, name: TableIdent, batches: Vec<RecordBatch>) -> Result<(), Error> {
+        if batches.is_empty() {
+            return Ok(());
+        }
 
-        // metadata for parquet writer
+        let mut table = self.catalog.load_table(&name).await?;
+        let spec = table.metadata().default_partition_spec();
+        if !spec.is_unpartitioned() {
+            return Err(Error::NotSupportedSql(
+                "partitioned tables are not supported yet".to_string(),
+            ));
+        }
+
+        // The table schema is the source of truth for Arrow field IDs and types.
+        let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())?;
+        let batches = batches
+            .into_iter()
+            .map(|batch| align_batch(&batch, &arrow_schema))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Write the data files once; retries only re-commit the metadata.
+        let data_files = self.write_data_files(&table, batches).await?;
+        let max_retries = table
+            .metadata()
+            .properties()
+            .get("commit.retry.num-retries")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3u32);
+        let mut attempt = 0u32;
+
+        loop {
+            if attempt > 0 {
+                table = self.catalog.load_table(&name).await?;
+            }
+
+            let transaction = Transaction::new(&table);
+            let mut append = transaction.fast_append(None, vec![])?;
+            append.add_data_files(data_files.clone())?;
+            let transaction = append.apply().await?;
+
+            match transaction.commit(&*self.catalog).await {
+                Ok(_) => return Ok(()),
+                Err(error) if is_commit_conflict(&error) && attempt < max_retries => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)))
+                        .await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    async fn write_data_files(
+        &self,
+        table: &Table,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<DataFile>, Error> {
+        let spec = table.metadata().default_partition_spec();
         let file_io = table.file_io();
         let location = DefaultLocationGenerator::new(table.metadata().clone())?;
 
-        // writing files to parquet first
-        let prefix = format!("{}-{}", name.name, Uuid::new_v4());
-        let file_name_generator = DefaultFileNameGenerator::new(
-            prefix,
-            None,                                   //suffix
-            iceberg::spec::DataFileFormat::Parquet, //format
-        );
-        let parquet_props = parquet::file::properties::WriterProperties::builder().build();
+        let prefix = format!("{}-{}", table.identifier().name(), Uuid::new_v4());
+        let file_name_generator =
+            DefaultFileNameGenerator::new(prefix, None, iceberg::spec::DataFileFormat::Parquet);
         let parquet_writer_builder = ParquetWriterBuilder::new(
-            parquet_props,
+            parquet_writer_properties(table.metadata()),
             table.metadata().current_schema().clone(),
             file_io.clone(),
             location,
             file_name_generator,
         );
 
-        // just one partition `0` for now
-        let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
-        let mut writer = data_file_writer_builder.build().await?;
+        let mut writer = DataFileWriterBuilder::new(parquet_writer_builder, None, spec.spec_id())
+            .build()
+            .await?;
 
-        writer.write(batch).await?;
+        for batch in batches {
+            writer.write(batch).await?;
+        }
 
-        let data_files = writer.close().await?;
-
-        // now write to the metadata of our table
-        fast_append.add_data_files(data_files)?;
-        let transaction = fast_append.apply().await?;
-
-        transaction.commit(&*self.catalog).await?;
-
-        Ok(())
+        Ok(writer.close().await?)
     }
 
     /// Pushes down predicates and projection to iceberg to handle
@@ -406,6 +478,10 @@ fn new_rest_catalog() -> Result<RestCatalog, Error> {
             .build(),
     ))
 }
+fn is_commit_conflict(error: &iceberg::Error) -> bool {
+    error.message().contains("CommitFailedException")
+}
+
 #[derive(Debug)]
 struct WalRecover {
     catalog: Arc<dyn Catalog>,
@@ -415,18 +491,15 @@ struct WalRecover {
 mod tests {
     use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::Field;
+    use iceberg::NamespaceIdent;
 
     use super::*;
 
     fn test_batch() -> RecordBatch {
         RecordBatch::try_new(
             arrow::datatypes::Schema::new(vec![
-                Field::new("id", arrow::datatypes::DataType::Int32, false).with_metadata(
-                    HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())]),
-                ),
-                Field::new("name", arrow::datatypes::DataType::Utf8, false).with_metadata(
-                    HashMap::from([("PARQUET:field_id".to_string(), "2".to_string())]),
-                ),
+                Field::new("id", arrow::datatypes::DataType::Int32, false),
+                Field::new("name", arrow::datatypes::DataType::Utf8, false),
             ])
             .into(),
             vec![
@@ -503,7 +576,7 @@ mod tests {
             NamespaceIdent::new("a_database".to_string()),
             "my_table".to_string(),
         );
-        storage.write(table.clone(), r).await.unwrap();
+        storage.write(table.clone(), vec![r]).await.unwrap();
 
         let results = storage
             .scan(
@@ -588,8 +661,14 @@ mod tests {
             NamespaceIdent::new("multi_file_db".to_string()),
             "t".to_string(),
         );
-        storage.write(table.clone(), test_batch()).await.unwrap();
-        storage.write(table.clone(), test_batch()).await.unwrap();
+        storage
+            .write(table.clone(), vec![test_batch()])
+            .await
+            .unwrap();
+        storage
+            .write(table.clone(), vec![test_batch()])
+            .await
+            .unwrap();
 
         let output = storage
             .execute("use multi_file_db; select name from t where id = 4;")
@@ -636,5 +715,105 @@ mod tests {
             .await
             .unwrap();
         let _ = storage.execute("drop database multi_file_db;").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    pub async fn insert_values() {
+        let storage = Storage::new().unwrap();
+        let _ = storage.execute("use insert_db; drop table t;").await;
+        let _ = storage.execute("drop database insert_db;").await;
+
+        let output = storage
+            .execute(
+                "create database insert_db; use insert_db; create table t (id int32, name string);\
+                 insert into t values (1, 'a'), (2, 'b');",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.last().unwrap(),
+            &Output::Inserted {
+                table: "t".to_string(),
+                rows: 2
+            }
+        );
+
+        let table = TableIdent::new(
+            NamespaceIdent::new("insert_db".to_string()),
+            "t".to_string(),
+        );
+        let loaded = storage.catalog.load_table(&table).await.unwrap();
+        assert_eq!(loaded.metadata().snapshots().count(), 1);
+
+        let output = storage
+            .execute("use insert_db; select id, name from t;")
+            .await
+            .unwrap();
+        let batch = match output.get(0).unwrap() {
+            Output::Select(batches) => batches.get(0).unwrap(),
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2]);
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "a");
+        assert_eq!(names.value(1), "b");
+
+        // Omitted columns become NULL.
+        let output = storage
+            .execute("use insert_db; insert into t (name) values ('c');")
+            .await
+            .unwrap();
+        assert_eq!(
+            output.get(0).unwrap(),
+            &Output::Inserted {
+                table: "t".to_string(),
+                rows: 1
+            }
+        );
+        let output = storage
+            .execute("use insert_db; select id, name from t;")
+            .await
+            .unwrap();
+        let batch = match output.get(0).unwrap() {
+            Output::Select(batches) => batches,
+            other => panic!("expected select results, got {other:?}"),
+        };
+        assert_eq!(batch.iter().map(|batch| batch.num_rows()).sum::<usize>(), 3);
+        let mut saw_null_id = false;
+        for batch in batch {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            saw_null_id |= (0..ids.len()).any(|row| ids.is_null(row));
+        }
+        assert!(saw_null_id);
+
+        // Bad row arity is a bind error, not a panic.
+        assert!(storage
+            .execute("use insert_db; insert into t values (1);")
+            .await
+            .is_err());
+
+        storage
+            .execute("use insert_db; drop table t;")
+            .await
+            .unwrap();
+        let _ = storage.execute("drop database insert_db;").await;
     }
 }
